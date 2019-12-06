@@ -148,6 +148,13 @@ class Context
     public $clauses = [];
 
     /**
+     * A list of hashed clauses that have already been factored in
+     *
+     * @var list<string>
+     */
+    public $reconciled_expression_clauses = [];
+
+    /**
      * Whether or not to do a deep analysis and collect mutations to this context
      *
      * @var bool
@@ -487,31 +494,33 @@ class Context
     }
 
     /**
+     * @param  Clause[]             $clauses
      * @param  string[]             $changed_var_ids
      *
-     * @return void
+     * @return array{0: list<Clause>, list<Clause>}
      */
-    public function removeReconciledClauses(array $changed_var_ids)
+    public static function removeReconciledClauses(array $clauses, array $changed_var_ids)
     {
-        $this->clauses = \array_values(
-            array_filter(
-                $this->clauses,
-                /** @return bool */
-                function (Clause $c) use ($changed_var_ids) {
-                    if ($c->wedge) {
-                        return true;
-                    }
+        $included_clauses = [];
+        $rejected_clauses = [];
 
-                    foreach ($c->possibilities as $key => $_) {
-                        if (in_array($key, $changed_var_ids, true)) {
-                            return false;
-                        }
-                    }
+        foreach ($clauses as $c) {
+            if ($c->wedge) {
+                $included_clauses[] = $c;
+                continue;
+            }
 
-                    return true;
+            foreach ($c->possibilities as $key => $_) {
+                if (in_array($key, $changed_var_ids, true)) {
+                    $rejected_clauses[] = $c;
+                    continue 2;
                 }
-            )
-        );
+            }
+
+            $included_clauses[] = $c;
+        }
+
+        return [$included_clauses, $rejected_clauses];
     }
 
     /**

@@ -88,6 +88,7 @@ class IfAnalyzer
             );
 
             $if_context = $if_conditional_scope->if_context;
+
             $original_context = $if_conditional_scope->original_context;
             $cond_referenced_var_ids = $if_conditional_scope->cond_referenced_var_ids;
             $cond_assigned_var_ids = $if_conditional_scope->cond_assigned_var_ids;
@@ -152,7 +153,22 @@ class IfAnalyzer
             $if_clauses = Algebra::simplifyCNF($if_clauses);
         }
 
-        $if_context->clauses = Algebra::simplifyCNF(array_merge($context->clauses, $if_clauses));
+        $if_context_clauses = array_merge($context->clauses, $if_clauses);
+
+        if ($if_context->reconciled_expression_clauses) {
+            $reconciled_expression_clauses = $if_context->reconciled_expression_clauses;
+
+            $if_context_clauses = array_values(
+                array_filter(
+                    $if_context_clauses,
+                    function ($c) use ($reconciled_expression_clauses) {
+                        return !in_array($c->getHash(), $reconciled_expression_clauses);
+                    }
+                )
+            );
+        }
+
+        $if_context->clauses = Algebra::simplifyCNF($if_context_clauses);
 
         // define this before we alter local claues after reconciliation
         $if_scope->reasonable_clauses = $if_context->clauses;
@@ -231,7 +247,7 @@ class IfAnalyzer
             }
 
             if ($changed_var_ids) {
-                $if_context->removeReconciledClauses($changed_var_ids);
+                $if_context->clauses = Context::removeReconciledClauses($if_context->clauses, $changed_var_ids)[0];
             }
 
             $if_scope->if_cond_changed_var_ids = $changed_var_ids;
@@ -470,7 +486,7 @@ class IfAnalyzer
     private static function analyzeIfConditional(
         StatementsAnalyzer $statements_analyzer,
         PhpParser\Node\Expr $cond,
-        Context $context,
+        Context $outer_context,
         Codebase $codebase,
         IfScope $if_scope,
         ?int $branch_point
@@ -485,33 +501,34 @@ class IfAnalyzer
 
         $entry_clauses = [];
 
+        // used when evaluating elseifs
         if ($if_scope->negated_clauses) {
-            $entry_clauses = array_merge($context->clauses, $if_scope->negated_clauses);
+            $entry_clauses = array_merge($outer_context->clauses, $if_scope->negated_clauses);
 
             $changed_var_ids = [];
 
             if ($if_scope->negated_types) {
                 $vars_reconciled = Reconciler::reconcileKeyedTypes(
                     $if_scope->negated_types,
-                    $context->vars_in_scope,
+                    $outer_context->vars_in_scope,
                     $changed_var_ids,
                     [],
                     $statements_analyzer,
                     [],
-                    $context->inside_loop,
+                    $outer_context->inside_loop,
                     new CodeLocation(
                         $statements_analyzer->getSource(),
                         $cond instanceof PhpParser\Node\Expr\BooleanNot
                             ? $cond->expr
                             : $cond,
-                        $context->include_location,
+                        $outer_context->include_location,
                         false
                     )
                 );
 
                 if ($changed_var_ids) {
-                    $context = clone $context;
-                    $context->vars_in_scope = $vars_reconciled;
+                    $outer_context = clone $outer_context;
+                    $outer_context->vars_in_scope = $vars_reconciled;
 
                     $entry_clauses = array_values(
                         array_filter(
@@ -528,61 +545,63 @@ class IfAnalyzer
             }
         }
 
-        $context->inside_conditional = true;
+        $outer_context->inside_conditional = true;
 
-        $pre_condition_vars_in_scope = $context->vars_in_scope;
+        $pre_condition_vars_in_scope = $outer_context->vars_in_scope;
 
-        $referenced_var_ids = $context->referenced_var_ids;
-        $context->referenced_var_ids = [];
+        $referenced_var_ids = $outer_context->referenced_var_ids;
+        $outer_context->referenced_var_ids = [];
 
-        $pre_assigned_var_ids = $context->assigned_var_ids;
-        $context->assigned_var_ids = [];
+        $pre_assigned_var_ids = $outer_context->assigned_var_ids;
+        $outer_context->assigned_var_ids = [];
 
         if ($first_if_cond_expr) {
-            if (ExpressionAnalyzer::analyze($statements_analyzer, $first_if_cond_expr, $context) === false) {
+            if (ExpressionAnalyzer::analyze($statements_analyzer, $first_if_cond_expr, $outer_context) === false) {
                 throw new \Psalm\Exception\ScopeAnalysisException();
             }
         }
 
-        $first_cond_assigned_var_ids = $context->assigned_var_ids;
-        $context->assigned_var_ids = array_merge(
+        $first_cond_assigned_var_ids = $outer_context->assigned_var_ids;
+        $outer_context->assigned_var_ids = array_merge(
             $pre_assigned_var_ids,
             $first_cond_assigned_var_ids
         );
 
-        $first_cond_referenced_var_ids = $context->referenced_var_ids;
-        $context->referenced_var_ids = array_merge(
+        $first_cond_referenced_var_ids = $outer_context->referenced_var_ids;
+        $outer_context->referenced_var_ids = array_merge(
             $referenced_var_ids,
             $first_cond_referenced_var_ids
         );
 
-        $context->inside_conditional = false;
+        $outer_context->inside_conditional = false;
 
-        $if_context = clone $context;
+        $if_context = clone $outer_context;
+        $if_conditional_context = clone $if_context;
+        $if_conditional_context->parent_context = $if_context;
 
         if ($codebase->alter_code) {
-            $if_context->branch_point = $branch_point;
+            $if_conditional_context->branch_point = $branch_point;
         }
 
-        // we need to clone the current context so our ongoing updates to $context don't mess with elseif/else blocks
-        $original_context = clone $context;
+        // we need to clone the current context so our ongoing updates to $outer_context don't mess with elseif/else blocks
+        $original_context = clone $outer_context;
 
-        $if_context->inside_conditional = true;
+        $if_conditional_context->inside_conditional = true;
 
         if ($first_if_cond_expr !== $cond) {
-            $assigned_var_ids = $context->assigned_var_ids;
-            $if_context->assigned_var_ids = [];
+            $assigned_var_ids = $outer_context->assigned_var_ids;
+            $if_conditional_context->assigned_var_ids = [];
 
-            $referenced_var_ids = $context->referenced_var_ids;
-            $if_context->referenced_var_ids = [];
+            $referenced_var_ids = $outer_context->referenced_var_ids;
+            $if_conditional_context->referenced_var_ids = [];
 
-            if (ExpressionAnalyzer::analyze($statements_analyzer, $cond, $if_context) === false) {
+            if (ExpressionAnalyzer::analyze($statements_analyzer, $cond, $if_conditional_context) === false) {
                 throw new \Psalm\Exception\ScopeAnalysisException();
             }
 
             /** @var array<string, bool> */
-            $more_cond_referenced_var_ids = $if_context->referenced_var_ids;
-            $if_context->referenced_var_ids = array_merge(
+            $more_cond_referenced_var_ids = $if_conditional_context->referenced_var_ids;
+            $if_conditional_context->referenced_var_ids = array_merge(
                 $more_cond_referenced_var_ids,
                 $referenced_var_ids
             );
@@ -593,8 +612,8 @@ class IfAnalyzer
             );
 
             /** @var array<string, bool> */
-            $more_cond_assigned_var_ids = $if_context->assigned_var_ids;
-            $if_context->assigned_var_ids = array_merge(
+            $more_cond_assigned_var_ids = $if_conditional_context->assigned_var_ids;
+            $if_conditional_context->assigned_var_ids = array_merge(
                 $more_cond_assigned_var_ids,
                 $assigned_var_ids
             );
@@ -619,7 +638,7 @@ class IfAnalyzer
                 return true;
             },
             array_diff_key(
-                $if_context->vars_in_scope,
+                $if_conditional_context->vars_in_scope,
                 $pre_condition_vars_in_scope,
                 $cond_referenced_var_ids,
                 $cond_assigned_var_ids
@@ -645,7 +664,7 @@ class IfAnalyzer
 
         $cond_referenced_var_ids = array_merge($newish_var_ids, $cond_referenced_var_ids);
 
-        $if_context->inside_conditional = false;
+        $if_conditional_context->inside_conditional = false;
 
         return new \Psalm\Internal\Scope\IfConditionalScope(
             $if_context,
@@ -1128,7 +1147,10 @@ class IfAnalyzer
             $elseif_context->vars_in_scope = $elseif_vars_reconciled;
 
             if ($changed_var_ids) {
-                $elseif_context->removeReconciledClauses($changed_var_ids);
+                $elseif_context->clauses = Context::removeReconciledClauses(
+                    $elseif_context->clauses,
+                    $changed_var_ids
+                )[0];
             }
         }
 
@@ -1466,7 +1488,7 @@ class IfAnalyzer
 
             $else_context->vars_in_scope = $else_vars_reconciled;
 
-            $else_context->removeReconciledClauses($changed_var_ids);
+            $else_context->clauses = Context::removeReconciledClauses($else_context->clauses, $changed_var_ids)[0];
         }
 
         $old_else_context = clone $else_context;
