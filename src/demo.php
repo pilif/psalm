@@ -2,6 +2,7 @@
 
 namespace App;
 
+/** @psalm-suppress MissingFile */
 @include('does not exist.php');
 
 include 'demo2.php';
